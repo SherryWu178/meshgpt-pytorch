@@ -324,7 +324,18 @@ class MeshAutoencoderTrainer(Module):
 
         self.print('training complete')
         
-    def train(self, num_epochs, stop_at_loss = None, diplay_graph = False):
+    def train(self, num_epochs, stop_at_loss=None, diplay_graph=False, use_wandb=False, wandb_run_name=None):
+        if use_wandb:
+            import wandb
+            wandb.init(
+                project="meshgpt_training",
+                name=wandb_run_name or f"run_{wandb.util.generate_id()}",
+                config={
+                    "epochs": num_epochs,
+                    "grad_accum_every": self.grad_accum_every,
+                }
+            )
+
         epoch_losses, epoch_recon_losses, epoch_commit_losses = [] , [],[] 
         self.model.train() 
         
@@ -359,7 +370,43 @@ class MeshAutoencoderTrainer(Module):
                 if is_last or (batch_idx + 1 == len(self.dataloader)): 
                     self.optimizer.step()
                     self.optimizer.zero_grad() 
-                    
+                
+            if self.val_dataloader is not None:
+                self.model.eval()
+                val_loss, val_recon_loss, val_commit_loss = 0.0, 0.0, 0.0
+                with torch.no_grad():
+                    for val_batch in self.val_dataloader:
+                        if isinstance(val_batch, tuple):
+                            val_kwargs = dict(zip(self.data_kwargs, val_batch))
+                        elif isinstance(val_batch, dict):
+                            val_kwargs = val_batch
+                        device = next(self.model.parameters()).device
+                        val_kwargs = {k: v.to(device) if torch.is_tensor(v) else v for k, v in val_kwargs.items()}
+                        maybe_del(val_kwargs, 'texts', 'text_embeds')
+
+                        loss, (recon, commit) = self.model(
+                            **val_kwargs,
+                            return_loss_breakdown=True
+                        )
+                        val_loss += loss.item()
+                        val_recon_loss += recon.item()
+                        val_commit_loss += commit.sum().item()
+                
+                val_loss /= len(self.val_dataloader)
+                val_recon_loss /= len(self.val_dataloader)
+                val_commit_loss /= len(self.val_dataloader)
+
+                if use_wandb:
+                    wandb.log({
+                        "val_loss": val_loss,
+                        "val_recon_loss": val_recon_loss,
+                        "val_commit_loss": val_commit_loss,
+                        "epoch": epoch + 1
+                    })
+                self.print(f"Validation - Epoch {epoch + 1} val_loss: {val_loss:.4f} val_recon: {val_recon_loss:.4f} val_commit: {val_commit_loss:.4f}")
+                self.model.train()
+
+                
                     
                 
             avg_recon_loss = total_epoch_recon_loss / len(self.dataloader)
@@ -369,7 +416,15 @@ class MeshAutoencoderTrainer(Module):
             epoch_losses.append(avg_epoch_loss)
             epoch_recon_losses.append(avg_recon_loss)
             epoch_commit_losses.append(avg_commit_loss)
-            
+
+            if use_wandb:
+                wandb.log({
+                    "epoch": epoch + 1,
+                    "avg_loss": avg_epoch_loss,
+                    "recon_loss": avg_recon_loss,
+                    "commit_loss": avg_commit_loss
+                })
+
             epochOut = f'Epoch {epoch + 1} average loss: {avg_epoch_loss} recon loss: {avg_recon_loss:.4f}: commit_loss {avg_commit_loss:.4f}'
 
             if len(epoch_losses) >= 4 and avg_epoch_loss > 0:
@@ -392,7 +447,9 @@ class MeshAutoencoderTrainer(Module):
                 if self.is_main and self.checkpoint_every_epoch is not None:
                     self.save(self.checkpoint_folder / f'mesh-autoencoder.ckpt.stop_at_loss_avg_loss_{avg_epoch_loss:.3f}.pt') 
                 break   
-  
+
+        if use_wandb:
+            wandb.finish()
         self.print('Training complete') 
         if diplay_graph:
             plt.figure(figsize=(10, 5))
@@ -403,8 +460,11 @@ class MeshAutoencoderTrainer(Module):
             plt.xlabel('Epoch')
             plt.ylabel('Average Loss')
             plt.grid(True)
+            plt.legend()
             plt.show()
+
         return epoch_losses[-1]
+
 # mesh transformer trainer
 
 class MeshTransformerTrainer(Module):
@@ -640,11 +700,23 @@ class MeshTransformerTrainer(Module):
         self.print('training complete')
  
             
-    def train(self, num_epochs, stop_at_loss = None, diplay_graph = False):
+    def train(self, num_epochs, stop_at_loss = None, diplay_graph = False, use_wandb=False, wandb_run_name=None):
             epoch_losses = [] 
+            val_losses = []
             epoch_size = len(self.dataloader)
             self.model.train() 
-            
+
+            if use_wandb:
+                import wandb
+                wandb.init(
+                    project="meshgpt_training",
+                    name=wandb_run_name or f"run_{wandb.util.generate_id()}",
+                    config={
+                        "epochs": num_epochs,
+                        "grad_accum_every": self.grad_accum_every,
+                    }
+                )
+                    
             for epoch in range(num_epochs): 
                 total_epoch_loss = 0.0 
                 
@@ -669,9 +741,31 @@ class MeshTransformerTrainer(Module):
                         
                 avg_epoch_loss = total_epoch_loss / epoch_size 
                 epochOut = f'Epoch {epoch + 1} average loss: {avg_epoch_loss}' 
-            
-            
                 epoch_losses.append(avg_epoch_loss) 
+
+                if hasattr(self, 'val_dataloader') and self.val_dataloader is not None:
+                    self.model.eval()
+                    val_loss = 0.0
+                    with torch.no_grad():
+                        for val_batch in self.val_dataloader:
+                            # Move tensors to the same device as the model
+                            val_batch = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in val_batch.items()}
+                            loss = self.model(**val_batch)
+                            val_loss += loss.item()
+                    val_loss /= len(self.val_dataloader)
+                    val_losses.append(val_loss)
+                    self.print(f"Validation loss: {val_loss:.4f}")
+                    self.model.train()
+                else:
+                    val_loss = None
+
+                # Logging W&B
+                if use_wandb:
+                    log_dict = {"epoch": epoch + 1, "train_loss": avg_epoch_loss}
+                    if val_loss is not None:
+                        log_dict["val_loss"] = val_loss
+                    wandb.log(log_dict)
+
 
                 if len(epoch_losses) >= 4 and avg_epoch_loss > 0:
                     avg_loss_improvement = sum(epoch_losses[-4:-1]) / 3 - avg_epoch_loss
